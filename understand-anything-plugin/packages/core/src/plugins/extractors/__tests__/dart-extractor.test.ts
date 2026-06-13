@@ -75,6 +75,51 @@ describe("DartExtractor", () => {
     });
   });
 
+  describe("extractStructure - parameter kinds", () => {
+    it("surfaces optional positional parameters", () => {
+      const { tree, parser, root } = parse(`void show([String? title, int count = 0]) {}\n`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.functions[0].params).toEqual(["title", "count"]);
+      tree.delete();
+      parser.delete();
+    });
+
+    it("surfaces named parameters wrapped in {...}", () => {
+      const { tree, parser, root } = parse(`void show({String? title, int count = 0}) {}\n`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.functions[0].params).toEqual(["title", "count"]);
+      tree.delete();
+      parser.delete();
+    });
+
+    it("mixes required and named parameters in one signature", () => {
+      const { tree, parser, root } = parse(`String join(List<String> items, {String sep = ","}) => "";\n`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.functions[0].params).toEqual(["items", "sep"]);
+      tree.delete();
+      parser.delete();
+    });
+
+    it("extracts `this.field` constructor parameters as the field name", () => {
+      const { tree, parser, root } = parse(`class Foo {
+  int x;
+  String y;
+  Foo(this.x, this.y);
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      const ctor = result.functions.find((f) => f.name === "Foo");
+      expect(ctor).toBeDefined();
+      expect(ctor!.params).toEqual(["x", "y"]);
+      tree.delete();
+      parser.delete();
+    });
+  });
+
   describe("extractStructure - classes", () => {
     it("extracts a class with fields and methods", () => {
       const { tree, parser, root } = parse(`class Counter {
@@ -96,9 +141,8 @@ describe("DartExtractor", () => {
       expect(result.classes[0].properties).toEqual(
         expect.arrayContaining(["count", "label"]),
       );
-      // Getters appear as `method_signature > getter_signature`, a separate node
-      // type from `function_signature` — not yet surfaced (documented limitation).
-      expect(result.classes[0].methods).not.toContain("value");
+      // Getters are surfaced as methods (`int get value` → "value").
+      expect(result.classes[0].methods).toContain("value");
 
       tree.delete();
       parser.delete();
@@ -144,6 +188,85 @@ describe("DartExtractor", () => {
       expect(result.classes[0].name).toBe("Square");
       expect(result.classes[0].methods).toContain("area");
 
+      tree.delete();
+      parser.delete();
+    });
+
+    it("extracts comma-list field declarations as separate properties", () => {
+      const { tree, parser, root } = parse(`class Foo { int a, b, c; }\n`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.classes[0].properties).toEqual(["a", "b", "c"]);
+      tree.delete();
+      parser.delete();
+    });
+  });
+
+  describe("extractStructure - getters and setters", () => {
+    it("surfaces a concrete getter as a method", () => {
+      const { tree, parser, root } = parse(`class Counter {
+  int _v = 0;
+  int get value => _v;
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.classes[0].methods).toContain("value");
+      expect(result.functions.map((f) => f.name)).toContain("value");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("surfaces a concrete setter as a method", () => {
+      const { tree, parser, root } = parse(`class Counter {
+  int _v = 0;
+  set value(int x) => _v = x;
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.classes[0].methods).toContain("value");
+      expect(result.functions.map((f) => f.name)).toContain("value");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("surfaces an abstract getter as a method", () => {
+      const { tree, parser, root } = parse(`abstract class Shape {
+  double get area;
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.classes[0].methods).toContain("area");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("surfaces an abstract setter as a method", () => {
+      const { tree, parser, root } = parse(`abstract class Box {
+  set width(int w);
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.classes[0].methods).toContain("width");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("does NOT export an underscore-prefixed getter", () => {
+      const { tree, parser, root } = parse(`class Counter {
+  int _v = 0;
+  int get _internal => _v;
+  int get visible => _v;
+}
+`);
+      const result = extractor.extractStructure(root);
+
+      const names = result.exports.map((e) => e.name);
+      expect(names).toContain("visible");
+      expect(names).not.toContain("_internal");
       tree.delete();
       parser.delete();
     });
@@ -314,6 +437,33 @@ describe("DartExtractor", () => {
       tree.delete();
       parser.delete();
     });
+
+    it("extracts a `dart:` SDK import", () => {
+      const { tree, parser, root } = parse(`import 'dart:io';\n`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.imports).toHaveLength(1);
+      expect(result.imports[0].source).toBe("dart:io");
+      expect(result.imports[0].specifiers).toEqual([]);
+      tree.delete();
+      parser.delete();
+    });
+
+    it("preserves declaration order across multiple imports", () => {
+      const { tree, parser, root } = parse(`import 'dart:io';
+import 'package:flutter/material.dart';
+import './foo.dart';
+`);
+      const result = extractor.extractStructure(root);
+
+      expect(result.imports.map((i) => i.source)).toEqual([
+        "dart:io",
+        "package:flutter/material.dart",
+        "./foo.dart",
+      ]);
+      tree.delete();
+      parser.delete();
+    });
   });
 
   describe("extractStructure - exports", () => {
@@ -321,6 +471,18 @@ describe("DartExtractor", () => {
       const { tree, parser, root } = parse(`export 'shared.dart';\n`);
       const result = extractor.extractStructure(root);
 
+      const sharedExport = result.exports.find((e) => e.name === "shared.dart");
+      expect(sharedExport).toBeDefined();
+      tree.delete();
+      parser.delete();
+    });
+
+    it("extracts a `show` clause on an export directive (URI only)", () => {
+      const { tree, parser, root } = parse(`export 'shared.dart' show PublicApi;\n`);
+      const result = extractor.extractStructure(root);
+
+      // We surface the export URI in exports[]; the show-list refinement is
+      // not modeled in the shared schema (export entries carry name + line).
       const sharedExport = result.exports.find((e) => e.name === "shared.dart");
       expect(sharedExport).toBeDefined();
       tree.delete();

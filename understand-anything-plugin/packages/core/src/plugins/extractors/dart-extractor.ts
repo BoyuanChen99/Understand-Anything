@@ -29,24 +29,68 @@ function extractFunctionName(sig: TreeSitterNode): string | null {
 }
 
 /**
- * Extract parameter names from a `formal_parameter_list`. Each
- * `formal_parameter` child carries the parameter name as its `identifier`
- * child; we ignore the type annotation.
+ * Extract the user-visible name from a `formal_parameter` (or one of its
+ * specialized children).
  *
- * Currently only required positional parameters (`formal_parameter` direct
- * children) are surfaced. Dart's optional positional (`[...]`) and named
- * (`{...}`) parameters are wrapped in `optional_formal_parameters` and
- * `named_parameter_list` container nodes respectively; supporting those is
- * left for a follow-up — the project-graph use case does not currently
- * distinguish parameter kinds.
+ * Three shapes seen in the AST:
+ *   - Regular     `Type name`     → `formal_parameter > { type_identifier, identifier }`
+ *   - This-init   `this.field`    → `formal_parameter > constructor_param > { this, ., identifier }`
+ *   - Super-init  `super.field`   → `formal_parameter > super_formal_parameter > { super, ., identifier }`
+ *
+ * Strategy: scan all direct children for an `identifier`; if absent, recurse
+ * one level into `constructor_param` / `super_formal_parameter` and pick the
+ * LAST identifier (the field name in `this.field`).
+ */
+function extractParamName(paramNode: TreeSitterNode): string | null {
+  // Direct identifier child wins (regular `Type name` parameter).
+  const direct = findChild(paramNode, "identifier");
+  if (direct) return direct.text;
+
+  // Nested wrappers — pick the last identifier we can find inside.
+  for (let i = 0; i < paramNode.childCount; i++) {
+    const child = paramNode.child(i);
+    if (!child) continue;
+    if (child.type === "constructor_param" || child.type === "super_formal_parameter") {
+      let last: string | null = null;
+      for (let j = 0; j < child.childCount; j++) {
+        const inner = child.child(j);
+        if (inner && inner.type === "identifier") last = inner.text;
+      }
+      if (last) return last;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract parameter names from a `formal_parameter_list`.
+ *
+ * Walks both required parameters (`formal_parameter` direct children) and the
+ * `optional_formal_parameters` wrapper, which the Dart grammar uses for BOTH
+ * optional positional `[...]` and named `{...}` parameters (the leading
+ * unnamed `[` vs `{` token distinguishes them — we don't need to for the
+ * project graph, both go into the same `params[]` list).
+ *
+ * Drops `this.x` and `super.x` initializer parameters' types and surfaces
+ * just the field name (see `extractParamName`).
  */
 function extractParams(sig: TreeSitterNode): string[] {
   const params: string[] = [];
-  const paramList = findChild(sig, "formal_parameter_list");
-  if (!paramList) return params;
-  for (const p of findChildren(paramList, "formal_parameter")) {
-    const id = findChild(p, "identifier");
-    if (id) params.push(id.text);
+  const list = findChild(sig, "formal_parameter_list");
+  if (!list) return params;
+  for (let i = 0; i < list.childCount; i++) {
+    const child = list.child(i);
+    if (!child) continue;
+    if (child.type === "formal_parameter") {
+      const name = extractParamName(child);
+      if (name) params.push(name);
+    } else if (child.type === "optional_formal_parameters") {
+      // Walk one level deeper — children are again `formal_parameter`.
+      for (const sub of findChildren(child, "formal_parameter")) {
+        const name = extractParamName(sub);
+        if (name) params.push(name);
+      }
+    }
   }
   return params;
 }
@@ -178,9 +222,24 @@ function collectClassBody(
         }
         continue;
       }
+      // Getter (`int get value`) — wrapped in method_signature with a
+      // sibling function_body. The name is the only identifier in getter_signature.
+      const getter = findChild(member, "getter_signature");
+      if (getter) {
+        const name = extractFunctionName(getter);
+        if (name) pushMethod(member, getter, name, methods, functions, exports);
+        continue;
+      }
+      // Setter (`set value(int x)`) — wrapped in method_signature with a
+      // sibling function_body. The first identifier is the name; the
+      // formal_parameter_list holds the assigned value.
+      const setter = findChild(member, "setter_signature");
+      if (setter) {
+        const name = extractFunctionName(setter);
+        if (name) pushMethod(member, setter, name, methods, functions, exports);
+        continue;
+      }
       // Concrete method: `method_signature > function_signature`.
-      // NOTE: `getter_signature` also nests under `method_signature` but is a
-      // separate node type — getters are not yet surfaced (documented limitation).
       const inner = findChild(member, "function_signature");
       if (!inner) continue;
       const name = extractFunctionName(inner);
@@ -196,6 +255,20 @@ function collectClassBody(
         }
         continue;
       }
+      // Abstract getter (`int get area;`) — `declaration > getter_signature`.
+      const absGetter = findChild(member, "getter_signature");
+      if (absGetter) {
+        const name = extractFunctionName(absGetter);
+        if (name) pushMethod(member, absGetter, name, methods, functions, exports);
+        continue;
+      }
+      // Abstract setter (`set width(int w);`) — `declaration > setter_signature`.
+      const absSetter = findChild(member, "setter_signature");
+      if (absSetter) {
+        const name = extractFunctionName(absSetter);
+        if (name) pushMethod(member, absSetter, name, methods, functions, exports);
+        continue;
+      }
       // Abstract method declarations (e.g. `double area();`) appear as
       // `declaration > function_signature` — not wrapped in `method_signature`.
       const fnSig = findChild(member, "function_signature");
@@ -207,6 +280,8 @@ function collectClassBody(
         continue;
       }
       // Field declaration — surface initialized_identifier names as properties.
+      // Comma-lists like `int a, b, c;` produce multiple initialized_identifier
+      // children inside a single initialized_identifier_list.
       const list = findChild(member, "initialized_identifier_list");
       if (!list) continue;
       for (const init of findChildren(list, "initialized_identifier")) {
